@@ -10,6 +10,7 @@ These tests do not call the hadacore_transform kernel and therefore
 run on all platforms.
 """
 
+import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
@@ -147,3 +148,24 @@ def test_kq_transform_per_layer_targeting():
     assert other_layer._kq_attn_transform is False, (
         "mlp layer should not have rotation enabled"
     )
+
+
+# ---------------------------------------------------------------------------
+# Error cases (all raised at model load, not at runtime)
+# ---------------------------------------------------------------------------
+
+
+def test_random_hadamard_raises_not_implemented():
+    """random-hadamard type must raise NotImplementedError at model load.
+
+    Silently skipping would apply no rotation at serving time, corrupting
+    attention for checkpoints that require the random rotation.
+    """
+    quant_config = _make_quant_config(
+        _make_transform_config("k_cache", scheme_type="random-hadamard")
+    )
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    with pytest.raises(NotImplementedError, match="random-hadamard"):
+        method.create_weights(layer)

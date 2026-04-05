@@ -1119,6 +1119,15 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                 if not is_match(layer_name, layer, args.targets, args.ignore):
                     continue
 
+                if scheme.type != "hadamard":
+                    raise NotImplementedError(
+                        f"KV cache rotation type '{scheme.type}' is not "
+                        "supported. Only 'hadamard' (deterministic Sylvester "
+                        "construction) is implemented. 'random-hadamard' and "
+                        "'random-matrix' require loading a stored rotation "
+                        "matrix, which is not yet implemented."
+                    )
+
                 return True
 
         return False
