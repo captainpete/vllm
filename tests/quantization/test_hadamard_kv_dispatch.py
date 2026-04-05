@@ -23,7 +23,10 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 
 
 def _make_transform_config(
-    location: str, scheme_type: str = "hadamard", targets: list[str] | None = None
+    location: str,
+    scheme_type: str = "hadamard",
+    targets: list[str] | None = None,
+    head_dim: int | None = None,
 ):
     """Build a minimal TransformConfig with a single apply entry."""
     from compressed_tensors.transform import (
@@ -36,6 +39,7 @@ def _make_transform_config(
         config_groups={
             "r3": TransformScheme(
                 type=scheme_type,
+                head_dim=head_dim,
                 apply=[
                     TransformArgs(
                         targets=targets if targets is not None else ["re:.*"],
@@ -168,4 +172,53 @@ def test_random_hadamard_raises_not_implemented():
 
     layer = _make_layer()
     with pytest.raises(NotImplementedError, match="random-hadamard"):
+        method.create_weights(layer)
+
+
+def test_missing_head_size_raises():
+    """Layer without head_size attribute must raise ValueError at model load."""
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    del layer.head_size
+    with pytest.raises(ValueError, match="head_size"):
+        method.create_weights(layer)
+
+
+def test_scheme_head_dim_mismatch_raises():
+    """scheme.head_dim != layer.head_size must raise ValueError at model load.
+
+    K_CACHE/Q_ATTN rotation operates at head granularity. A mismatch means the
+    checkpoint was calibrated with a different block size than the layer uses.
+    """
+    quant_config = _make_quant_config(_make_transform_config("k_cache", head_dim=64))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer(head_size=128)  # scheme says 64, layer says 128
+    with pytest.raises(ValueError, match="head_dim"):
+        method.create_weights(layer)
+
+
+def test_non_power_of_two_head_dim_raises():
+    """Non-power-of-two head_dim must raise ValueError at model load.
+
+    The hadacore kernel enforces this constraint. Failing at model load gives
+    a clear error instead of a CUDA assertion during the first forward pass.
+    """
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer(head_size=96)  # 96 is not a power of two
+    with pytest.raises(ValueError, match="power of two"):
+        method.create_weights(layer)
+
+
+def test_head_dim_exceeds_kernel_limit_raises():
+    """head_dim > 2^15 must raise ValueError at model load."""
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer(head_size=2**16)
+    with pytest.raises(ValueError, match="2\\^15"):
         method.create_weights(layer)

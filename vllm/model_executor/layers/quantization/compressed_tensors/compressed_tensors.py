@@ -1105,6 +1105,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
             return False
 
         layer_name = getattr(layer, "layer_name", "")
+        head_dim = getattr(layer, "head_size", None)
 
         for (
             _scheme_name,
@@ -1126,6 +1127,31 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                         "construction) is implemented. 'random-hadamard' and "
                         "'random-matrix' require loading a stored rotation "
                         "matrix, which is not yet implemented."
+                    )
+
+                if head_dim is None:
+                    raise ValueError(
+                        f"Layer '{layer_name}': K_CACHE/Q_ATTN Hadamard "
+                        "rotation requires head_size attribute."
+                    )
+                if scheme.head_dim is not None and scheme.head_dim != head_dim:
+                    raise ValueError(
+                        f"Layer '{layer_name}': transform_config head_dim "
+                        f"({scheme.head_dim}) does not match layer head_size "
+                        f"({head_dim}). K_CACHE/Q_ATTN rotation operates at "
+                        "head granularity."
+                    )
+                if head_dim <= 0 or (head_dim & (head_dim - 1)) != 0:
+                    raise ValueError(
+                        f"KV cache Hadamard rotation requires head_dim to be "
+                        f"a power of two, got {head_dim} for layer "
+                        f"'{layer_name}'."
+                    )
+                if head_dim > 2**15:
+                    raise ValueError(
+                        f"KV cache Hadamard rotation requires head_dim <= "
+                        f"2^15 (hadacore kernel constraint), got {head_dim} "
+                        f"for layer '{layer_name}'."
                     )
 
                 return True
