@@ -16,7 +16,8 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     QuantizationType,
 )
-from compressed_tensors.transform import TransformConfig
+from compressed_tensors.transform import TransformConfig, TransformLocation
+from compressed_tensors.utils import is_match
 
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -1088,6 +1089,39 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
             layer.v_zero_point.weight_loader = partial(
                 _tp_aware_loader, kind="v", param_type="zero_point"
             )
+
+        # Wire up KQ cache Hadamard rotation.
+        # K_CACHE and Q_ATTN share the same rotation matrix.
+        # The inverse rotation for V and output is done in W_v/W_o by llm-compressor.
+        layer._kq_attn_transform = self._has_kq_attn_transform(layer)
+
+    def _has_kq_attn_transform(self, layer: torch.nn.Module) -> bool:
+        """Return True if this layer should have K_CACHE/Q_ATTN Hadamard rotation.
+
+        Walks the transform_config looking for K_CACHE or Q_ATTN locations
+        whose targets match this specific layer.
+        """
+        if self.quant_config.transform_config is None:
+            return False
+
+        layer_name = getattr(layer, "layer_name", "")
+
+        for (
+            _scheme_name,
+            scheme,
+        ) in self.quant_config.transform_config.config_groups.items():
+            for args in scheme.apply:
+                if TransformLocation(args.location) not in (
+                    TransformLocation.K_CACHE,
+                    TransformLocation.Q_ATTN,
+                ):
+                    continue
+                if not is_match(layer_name, layer, args.targets, args.ignore):
+                    continue
+
+                return True
+
+        return False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
