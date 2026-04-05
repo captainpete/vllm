@@ -27,6 +27,7 @@ def _make_transform_config(
     scheme_type: str = "hadamard",
     targets: list[str] | None = None,
     head_dim: int | None = None,
+    randomize: bool = False,
 ):
     """Build a minimal TransformConfig with a single apply entry."""
     from compressed_tensors.transform import (
@@ -40,6 +41,7 @@ def _make_transform_config(
             "r3": TransformScheme(
                 type=scheme_type,
                 head_dim=head_dim,
+                randomize=randomize,
                 apply=[
                     TransformArgs(
                         targets=targets if targets is not None else ["re:.*"],
@@ -172,6 +174,20 @@ def test_random_hadamard_raises_not_implemented():
 
     layer = _make_layer()
     with pytest.raises(NotImplementedError, match="random-hadamard"):
+        method.create_weights(layer)
+
+
+def test_randomize_true_raises_not_implemented():
+    """hadamard with randomize=True must raise NotImplementedError at model load.
+
+    randomize=True means a unique per-layer matrix is stored in the checkpoint.
+    Silently applying the deterministic FWHT instead would corrupt attention.
+    """
+    quant_config = _make_quant_config(_make_transform_config("k_cache", randomize=True))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    with pytest.raises(NotImplementedError, match="randomize"):
         method.create_weights(layer)
 
 

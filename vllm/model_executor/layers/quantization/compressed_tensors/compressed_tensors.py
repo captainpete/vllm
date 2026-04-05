@@ -1134,6 +1134,13 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                         "'random-matrix' require loading a stored rotation "
                         "matrix, which is not yet implemented."
                     )
+                if scheme.randomize:
+                    raise NotImplementedError(
+                        "KV cache Hadamard rotation with randomize=True is "
+                        "not supported. Randomized transforms require loading "
+                        "a per-layer rotation matrix from the checkpoint, "
+                        "which is not yet implemented."
+                    )
 
                 if head_dim is None:
                     raise ValueError(
