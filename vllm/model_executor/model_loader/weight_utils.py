@@ -1553,3 +1553,25 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+def is_hadamard_transform_weight(name: str) -> bool:
+    """Return True if *name* is a stored Hadamard rotation matrix weight.
+
+    compressed-tensors checkpoints with a ``transform_config`` store the
+    rotation matrices alongside the model weights, e.g.::
+
+        model.layers.0.self_attn.R3_q_attn.weight
+        model.layers.0.self_attn.R3_k_cache.weight
+
+    The suffix convention is ``{group_name}_{location}.weight`` where
+    *location* is one of the ``TransformArgs`` locations that trigger
+    KV-cache rotation (``q_attn`` or ``k_cache``).
+
+    vLLM applies the deterministic Fast Walsh-Hadamard Transform via
+    ``ops.hadacore_transform``, which reconstructs H from ``head_dim``
+    alone.  The stored matrix is never needed at serving time and has no
+    corresponding parameter in the model, so callers should skip it
+    rather than raising ``KeyError``.
+    """
+    return bool(re.search(r"\.self_attn\.\w+_(?:q_attn|k_cache)\.weight$", name))
