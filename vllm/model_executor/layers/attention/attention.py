@@ -386,6 +386,18 @@ class Attention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        # Guard against combining Hadamard rotation with online KV scale.
+        # maybe_calc_kv_scales runs before the rotation, so scales would be
+        # computed on unrotated K.
+        if self._kq_attn_transform and self.calculate_kv_scales:
+            raise ValueError(
+                f"Layer '{prefix}': cannot combine K_CACHE/Q_ATTN Hadamard "
+                "rotation with calculate_kv_scales=True. The KV scale "
+                "computation (maybe_calc_kv_scales) runs before the rotation "
+                "and would produce scales for unrotated K. Either disable "
+                "calculate_kv_scales or remove the transform config."
+            )
+
         # for attn backends supporting query quantization
         self.query_quant = None
         if (
