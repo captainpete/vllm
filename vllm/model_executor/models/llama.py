@@ -54,6 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
+    is_hadamard_transform_weight,
     maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
@@ -494,6 +495,9 @@ class LlamaModel(nn.Module, EagleModelMixin):
                     continue
 
                 if is_pp_missing_parameter(name, self):
+                    continue
+
+                if is_hadamard_transform_weight(name):
                     continue
 
                 param = params_dict[name]
