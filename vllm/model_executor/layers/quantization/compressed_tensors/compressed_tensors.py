@@ -1117,6 +1117,12 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                     TransformLocation.Q_ATTN,
                 ):
                     continue
+                if current_platform.is_rocm():
+                    raise NotImplementedError(
+                        "K_CACHE/Q_ATTN Hadamard rotation requires the "
+                        "hadacore_transform kernel, which is not supported "
+                        "on ROCm."
+                    )
                 if not is_match(layer_name, layer, args.targets, args.ignore):
                     continue
 

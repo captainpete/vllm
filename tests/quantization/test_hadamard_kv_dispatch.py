@@ -222,3 +222,26 @@ def test_head_dim_exceeds_kernel_limit_raises():
     layer = _make_layer(head_size=2**16)
     with pytest.raises(ValueError, match="2\\^15"):
         method.create_weights(layer)
+
+
+def test_rocm_raises_not_implemented():
+    """K_CACHE/Q_ATTN on ROCm must raise NotImplementedError at model load.
+
+    hadacore_transform is a CUDA-only kernel. Failing at model load is better
+    than a cryptic op error during the first forward pass.
+    """
+    from unittest.mock import patch
+
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+    layer = _make_layer()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.compressed_tensors"
+            ".compressed_tensors.current_platform.is_rocm",
+            return_value=True,
+        ),
+        pytest.raises(NotImplementedError, match="ROCm"),
+    ):
+        method.create_weights(layer)
