@@ -16,7 +16,8 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     QuantizationType,
 )
-from compressed_tensors.transform import TransformConfig
+from compressed_tensors.transform import TransformConfig, TransformLocation
+from compressed_tensors.utils import is_match
 
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -937,6 +938,8 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
     checkpoints.
     """
 
+    quant_config: CompressedTensorsConfig
+
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.validate_kv_cache_scheme(quant_config.kv_cache_scheme)
         super().__init__(quant_config)
@@ -1042,10 +1045,12 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
                 # FlashAttn expects [num_kv_heads] instead of [num_heads] for q_scale.
                 # We reduce by taking the max scale in each attention head group.
+                assert self.quant_config.total_num_heads is not None
+                assert self.quant_config.total_num_kv_heads is not None
                 if kind == "q":
                     reduction_factor = (
-                        self.quant_config.total_num_heads  # type: ignore[attr-defined]
-                        // self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
+                        self.quant_config.total_num_heads
+                        // self.quant_config.total_num_kv_heads
                     )
                     loaded_weight = torch.amax(
                         loaded_weight.view(-1, reduction_factor), dim=1
@@ -1054,7 +1059,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                 tp_rank = get_tensor_model_parallel_rank()
                 tp_size = get_tensor_model_parallel_world_size()
 
-                if layer.num_kv_heads * tp_size == self.quant_config.total_num_kv_heads:  # type: ignore[attr-defined]
+                if layer.num_kv_heads * tp_size == self.quant_config.total_num_kv_heads:
                     # heads evenly distributed
                     loaded_weight = loaded_weight[
                         tp_rank * layer.num_kv_heads : (tp_rank + 1)
@@ -1063,7 +1068,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                 else:
                     # heads replicated to match TP size
                     assert layer.num_kv_heads == 1
-                    replicas = tp_size // self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
+                    replicas = tp_size // self.quant_config.total_num_kv_heads
                     shard_rank = tp_rank // replicas
                     loaded_weight = loaded_weight[shard_rank : shard_rank + 1]
 
@@ -1088,6 +1093,87 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
             layer.v_zero_point.weight_loader = partial(
                 _tp_aware_loader, kind="v", param_type="zero_point"
             )
+
+        # Wire up KQ cache Hadamard rotation.
+        # K_CACHE and Q_ATTN share the same rotation matrix.
+        # The inverse rotation for V and output is done in W_v/W_o by llm-compressor.
+        layer._kq_attn_transform = self._has_kq_attn_transform(layer)
+
+    def _has_kq_attn_transform(self, layer: torch.nn.Module) -> bool:
+        """Return True if this layer should have K_CACHE/Q_ATTN Hadamard rotation.
+
+        Walks the transform_config looking for K_CACHE or Q_ATTN locations
+        whose targets match this specific layer.
+        """
+        if self.quant_config.transform_config is None:
+            return False
+
+        layer_name = getattr(layer, "layer_name", "")
+        head_dim = getattr(layer, "head_size", None)
+
+        for (
+            _scheme_name,
+            scheme,
+        ) in self.quant_config.transform_config.config_groups.items():
+            for args in scheme.apply:
+                if TransformLocation(args.location) not in (
+                    TransformLocation.K_CACHE,
+                    TransformLocation.Q_ATTN,
+                ):
+                    continue
+                if current_platform.is_rocm():
+                    raise NotImplementedError(
+                        "K_CACHE/Q_ATTN Hadamard rotation requires the "
+                        "hadacore_transform kernel, which is not supported "
+                        "on ROCm."
+                    )
+                if not is_match(layer_name, layer, args.targets, args.ignore):
+                    continue
+
+                if scheme.type != "hadamard":
+                    raise NotImplementedError(
+                        f"KV cache rotation type '{scheme.type}' is not "
+                        "supported. Only 'hadamard' (deterministic Sylvester "
+                        "construction) is implemented. 'random-hadamard' and "
+                        "'random-matrix' require loading a stored rotation "
+                        "matrix, which is not yet implemented."
+                    )
+                if scheme.randomize:
+                    raise NotImplementedError(
+                        "KV cache Hadamard rotation with randomize=True is "
+                        "not supported. Randomized transforms require loading "
+                        "a per-layer rotation matrix from the checkpoint, "
+                        "which is not yet implemented."
+                    )
+
+                if head_dim is None:
+                    raise ValueError(
+                        f"Layer '{layer_name}': K_CACHE/Q_ATTN Hadamard "
+                        "rotation requires head_size attribute."
+                    )
+                if scheme.head_dim is not None and scheme.head_dim != head_dim:
+                    raise ValueError(
+                        f"Layer '{layer_name}': transform_config head_dim "
+                        f"({scheme.head_dim}) does not match layer head_size "
+                        f"({head_dim}). K_CACHE/Q_ATTN rotation operates at "
+                        "head granularity."
+                    )
+                if head_dim <= 0 or (head_dim & (head_dim - 1)) != 0:
+                    raise ValueError(
+                        f"KV cache Hadamard rotation requires head_dim to be "
+                        f"a power of two, got {head_dim} for layer "
+                        f"'{layer_name}'."
+                    )
+                if head_dim > 2**15:
+                    raise ValueError(
+                        f"KV cache Hadamard rotation requires head_dim <= "
+                        f"2^15 (hadacore kernel constraint), got {head_dim} "
+                        f"for layer '{layer_name}'."
+                    )
+
+                return True
+
+        return False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """

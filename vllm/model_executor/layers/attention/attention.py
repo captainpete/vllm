@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
@@ -377,8 +378,25 @@ class Attention(nn.Module, AttentionLayerBase):
         # this variable will not be accessed if use_direct_call is True
         self.kv_cache = torch.tensor([])
 
+        # Set to True by CompressedTensorsKVCacheMethod.create_weights when the
+        # checkpoint's transform_config targets this layer with K_CACHE/Q_ATTN
+        # locations. Must be initialised before _init_kv_cache_quant.
+        self._kq_attn_transform = False
+
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
+
+        # Guard against combining Hadamard rotation with online KV scale.
+        # maybe_calc_kv_scales runs before the rotation, so scales would be
+        # computed on unrotated K.
+        if self._kq_attn_transform and self.calculate_kv_scales:
+            raise ValueError(
+                f"Layer '{prefix}': cannot combine K_CACHE/Q_ATTN Hadamard "
+                "rotation with calculate_kv_scales=True. The KV scale "
+                "computation (maybe_calc_kv_scales) runs before the rotation "
+                "and would produce scales for unrotated K. Either disable "
+                "calculate_kv_scales or remove the transform config."
+            )
 
         # for attn backends supporting query quantization
         self.query_quant = None
@@ -451,6 +469,16 @@ class Attention(nn.Module, AttentionLayerBase):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+            # K_CACHE/Q_ATTN Hadamard rotation (R3/SpinQuant-style).
+            # Applied post-RoPE, post-reshape, before both the KV cache write
+            # and the attention computation, so prefill and decode are consistent.
+            # K_CACHE and Q_ATTN share the same rotation matrix; V and output
+            # un-rotation are absorbed offline into W_v and W_o weights.
+            if self._kq_attn_transform and key is not None:
+                query = ops.hadacore_transform(query)
+                key = ops.hadacore_transform(key)
+
             kv_cache_dummy_dep = None
             if self.use_direct_call:
                 # Skip this if sharing KV cache with an earlier attention layer.

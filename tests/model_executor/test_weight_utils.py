@@ -11,6 +11,7 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     enable_hf_transfer,
+    is_hadamard_transform_weight,
     maybe_remap_kv_scale_name,
 )
 
@@ -175,6 +176,60 @@ class TestMaybeRemapKvScaleName:
             "model.layers.0.self_attn.qkv_proj.k_scale", empty_params
         )
         assert result is None
+
+
+class TestIsHadamardTransformWeight:
+    """Tests for is_hadamard_transform_weight.
+
+    compressed-tensors stores rotation matrices alongside model weights in
+    checkpoints that use transform_config (e.g. SpinQuant R3 checkpoints).
+    These weights have no corresponding parameter in vLLM's model and must
+    be skipped during weight loading.
+    """
+
+    def test_r3_q_attn_weight(self):
+        """Canonical R3 checkpoint q_attn matrix."""
+        assert is_hadamard_transform_weight("model.layers.0.self_attn.R3_q_attn.weight")
+
+    def test_r3_k_cache_weight(self):
+        """Canonical R3 checkpoint k_cache matrix."""
+        assert is_hadamard_transform_weight(
+            "model.layers.0.self_attn.R3_k_cache.weight"
+        )
+
+    def test_arbitrary_group_name_q_attn(self):
+        """Group name prefix other than R3 should still match."""
+        assert is_hadamard_transform_weight(
+            "model.layers.5.self_attn.spinquant_q_attn.weight"
+        )
+
+    def test_arbitrary_group_name_k_cache(self):
+        """Group name prefix other than R3 should still match."""
+        assert is_hadamard_transform_weight(
+            "model.layers.5.self_attn.spinquant_k_cache.weight"
+        )
+
+    def test_normal_weight_not_matched(self):
+        """Regular model weight must not be skipped."""
+        assert not is_hadamard_transform_weight(
+            "model.layers.0.self_attn.q_proj.weight"
+        )
+
+    def test_k_proj_weight_not_matched(self):
+        """k_proj weight must not be confused with k_cache."""
+        assert not is_hadamard_transform_weight(
+            "model.layers.0.self_attn.k_proj.weight"
+        )
+
+    def test_q_attn_in_middle_of_path_not_matched(self):
+        """q_attn appearing in a path component other than the leaf must not match."""
+        assert not is_hadamard_transform_weight(
+            "model.layers.0.q_attn_module.self_attn.weight"
+        )
+
+    def test_scale_name_not_matched(self):
+        """FP8 scale names must not be mistaken for transform weights."""
+        assert not is_hadamard_transform_weight("model.layers.0.self_attn.attn.k_scale")
 
 
 if __name__ == "__main__":

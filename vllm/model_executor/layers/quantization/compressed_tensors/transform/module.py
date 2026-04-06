@@ -26,7 +26,7 @@ class HadamardTransform(torch.nn.Module):
     """
     Class which handles weight loading, postprocessing, and application of
     transforms. Meant to be used with `CompressedTensorsLinearTransformMethod`
-    and attention transforms method (not implemented yet)
+    and `CompressedTensorsKVCacheMethod` (K_CACHE/Q_ATTN attention transforms).
     """
 
     transforms: dict[int, TransformTuple]  # info parsed from transforms config
