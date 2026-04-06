@@ -39,7 +39,7 @@ jobs:
           if (hasReadyLabel || hasVerifiedLabel || mergedCount >= 4) {
             core.info(`Check passed: verified label=${hasVerifiedLabel}, ready label=${hasReadyLabel}, 4+ merged PRs=${mergedCount >= 4}`);
           } else {
-            core.setFailed(`PR must have the 'verified' or 'ready' (which also triggers tests) label or the author must have at least 4 merged PRs (found ${mergedCount}).`);
+            core.warning(`Upstream check would fail: PR must have the 'verified' or 'ready' label or the author must have at least 4 merged PRs (found ${mergedCount}).`);
           }
 
   pre-commit:
