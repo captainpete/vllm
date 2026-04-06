@@ -938,6 +938,8 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
     checkpoints.
     """
 
+    quant_config: CompressedTensorsConfig
+
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.validate_kv_cache_scheme(quant_config.kv_cache_scheme)
         super().__init__(quant_config)
@@ -1043,10 +1045,12 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
                 # FlashAttn expects [num_kv_heads] instead of [num_heads] for q_scale.
                 # We reduce by taking the max scale in each attention head group.
+                assert self.quant_config.total_num_heads is not None
+                assert self.quant_config.total_num_kv_heads is not None
                 if kind == "q":
                     reduction_factor = (
-                        self.quant_config.total_num_heads  # type: ignore[attr-defined]
-                        // self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
+                        self.quant_config.total_num_heads
+                        // self.quant_config.total_num_kv_heads
                     )
                     loaded_weight = torch.amax(
                         loaded_weight.view(-1, reduction_factor), dim=1
@@ -1055,7 +1059,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                 tp_rank = get_tensor_model_parallel_rank()
                 tp_size = get_tensor_model_parallel_world_size()
 
-                if layer.num_kv_heads * tp_size == self.quant_config.total_num_kv_heads:  # type: ignore[attr-defined]
+                if layer.num_kv_heads * tp_size == self.quant_config.total_num_kv_heads:
                     # heads evenly distributed
                     loaded_weight = loaded_weight[
                         tp_rank * layer.num_kv_heads : (tp_rank + 1)
@@ -1064,7 +1068,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                 else:
                     # heads replicated to match TP size
                     assert layer.num_kv_heads == 1
-                    replicas = tp_size // self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
+                    replicas = tp_size // self.quant_config.total_num_kv_heads
                     shard_rank = tp_rank // replicas
                     loaded_weight = loaded_weight[shard_rank : shard_rank + 1]
 
