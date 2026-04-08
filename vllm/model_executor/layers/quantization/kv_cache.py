@@ -46,6 +46,52 @@ class BaseKVCacheMethod(QuantizeMethodBase):
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
+    def apply_kv_cache(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply transforms and write key/value to the paged KV cache.
+
+        Called from the ``vllm_apply_kv_cache`` custom op inside
+        ``Attention.forward()``, after RoPE and reshape, before the attention
+        kernel.  The op only calls this method when a quant_method is present;
+        otherwise it falls back to ``attn_layer.impl.do_kv_cache_update``
+        directly.
+
+        Subclasses that need pre-cache transforms (e.g. Hadamard rotation)
+        should override this method.  The override is responsible for both
+        the transform **and** writing to the cache; call
+        ``super().apply_kv_cache(...)`` to delegate the write after
+        transforming.
+
+        Note: this interface covers standard multi-head attention (MHA) only.
+        MLA uses a different tensor layout and a separate code path.
+
+        Args:
+            layer: the ``Attention`` layer instance.
+            query: ``[num_tokens, num_heads, head_size]`` — may be modified
+                in-place by the transform before being used in the attention
+                kernel.
+            key: ``[num_tokens, num_kv_heads, head_size]`` — transformed and
+                written to the paged cache.
+            value: ``[num_tokens, num_kv_heads, head_size_v]`` — written to
+                the paged cache unchanged by the default implementation.
+            kv_cache: paged KV cache tensor.
+            slot_mapping: token-to-slot mapping for the current batch.
+
+        Returns:
+            ``(query, key)`` after any transforms, for use by the attention
+            kernel.  ``value`` is not returned; it is written to the cache
+            but not transformed.
+        """
+        layer.impl.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        return query, key
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # skip if there are no weights to process (for example, weight reloading)
         if not hasattr(layer, "q_scale"):
