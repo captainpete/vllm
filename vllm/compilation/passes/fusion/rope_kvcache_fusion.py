@@ -144,8 +144,10 @@ class RopeReshapeKVCachePattern:
             q = q.view(-1, self.num_heads, self.head_size)
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
-            dummy = torch.ops.vllm.unified_kv_cache_update(k, v, self.layer_name)
-            return dummy, q, k, v
+            q_out, k_out, dummy = torch.ops.vllm.vllm_apply_kv_cache(
+                q, k, v, self.layer_name
+            )
+            return dummy, q_out, k_out, v
 
         def replacement(
             qkv: torch.Tensor,
@@ -207,6 +209,13 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
         attn_layers = get_layers_from_vllm_config(config, Attention)
         for _, layer in attn_layers.items():
             if layer.impl.fused_rope_kvcache_supported():
+                # Layers with a pre-cache KV transform (e.g. Hadamard rotation)
+                # use the general vllm_apply_kv_cache path, which handles the
+                # transform between RoPE and the cache write.  The fused kernel
+                # cannot accommodate an inter-step transform without kernel-level
+                # changes, so we leave those layers on the unfused path.
+                if getattr(layer, "_ct_kv_transform", None) is not None:
+                    continue
                 for is_neox in [True, False]:
                     RopeReshapeKVCachePattern(
                         layer=layer,
