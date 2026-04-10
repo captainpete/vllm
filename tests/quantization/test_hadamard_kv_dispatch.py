@@ -170,8 +170,33 @@ def test_kv_transform_per_layer_targeting():
 # ---------------------------------------------------------------------------
 
 
+def test_apply_query_calls_hadamard_transform():
+    """apply_query with a hadamard scheme must rotate query."""
+    from unittest.mock import patch
+
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    method.create_weights(layer)
+    layer.calculate_kv_scales = False
+
+    query = torch.randn(4, 8, 128)
+    rotated_query = torch.randn(4, 8, 128)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+        ".compressed_tensors.ops.hadacore_transform",
+        return_value=rotated_query,
+    ) as mock_rotate:
+        out_query = method.apply_query(layer, query)
+
+    mock_rotate.assert_called_once_with(query)
+    assert out_query is rotated_query
+
+
 def test_apply_kv_cache_calls_hadamard_transform():
-    """apply_kv_cache with a hadamard scheme must rotate query and key."""
+    """apply_kv_cache with a hadamard scheme must rotate key and write cache."""
     from unittest.mock import MagicMock, patch
 
     quant_config = _make_quant_config(_make_transform_config("k_cache"))
@@ -182,37 +207,51 @@ def test_apply_kv_cache_calls_hadamard_transform():
     layer.calculate_kv_scales = False
     layer.impl = MagicMock()
 
-    query = torch.randn(4, 8, 128)
     key = torch.randn(4, 8, 128)
     value = torch.randn(4, 8, 128)
     kv_cache = torch.zeros(2, 4, 8, 128)
     slot_mapping = torch.arange(4)
 
-    rotated_query = torch.randn(4, 8, 128)
     rotated_key = torch.randn(4, 8, 128)
-    rotate_results = iter([rotated_query, rotated_key])
 
     with patch(
         "vllm.model_executor.layers.quantization.compressed_tensors"
         ".compressed_tensors.ops.hadacore_transform",
-        side_effect=lambda x: next(rotate_results),
+        return_value=rotated_key,
     ) as mock_rotate:
-        out_query, out_key = method.apply_kv_cache(
-            layer, query, key, value, kv_cache, slot_mapping
-        )
+        method.apply_kv_cache(layer, key, value, kv_cache, slot_mapping)
 
-    assert mock_rotate.call_count == 2, (
-        "hadacore_transform must be called for query and key"
-    )
-    assert out_query is rotated_query
-    assert out_key is rotated_key
+    mock_rotate.assert_called_once_with(key)
     layer.impl.do_kv_cache_update.assert_called_once_with(
         layer, rotated_key, value, kv_cache, slot_mapping
     )
 
 
+def test_apply_query_no_transform_when_scheme_is_none():
+    """apply_query with no resolved scheme must not rotate query."""
+    from unittest.mock import patch
+
+    quant_config = _make_quant_config(transform_config=None)
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    method.create_weights(layer)
+    layer.calculate_kv_scales = False
+
+    query = torch.randn(4, 8, 128)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+        ".compressed_tensors.ops.hadacore_transform",
+    ) as mock_rotate:
+        out_query = method.apply_query(layer, query)
+
+    mock_rotate.assert_not_called()
+    assert out_query is query
+
+
 def test_apply_kv_cache_no_transform_when_scheme_is_none():
-    """apply_kv_cache with no resolved scheme must not rotate query or key."""
+    """apply_kv_cache with no resolved scheme must not rotate key."""
     from unittest.mock import MagicMock, patch
 
     quant_config = _make_quant_config(transform_config=None)
@@ -223,7 +262,6 @@ def test_apply_kv_cache_no_transform_when_scheme_is_none():
     layer.calculate_kv_scales = False
     layer.impl = MagicMock()
 
-    query = torch.randn(4, 8, 128)
     key = torch.randn(4, 8, 128)
     value = torch.randn(4, 8, 128)
     kv_cache = torch.zeros(2, 4, 8, 128)
@@ -233,13 +271,12 @@ def test_apply_kv_cache_no_transform_when_scheme_is_none():
         "vllm.model_executor.layers.quantization.compressed_tensors"
         ".compressed_tensors.ops.hadacore_transform",
     ) as mock_rotate:
-        out_query, out_key = method.apply_kv_cache(
-            layer, query, key, value, kv_cache, slot_mapping
-        )
+        method.apply_kv_cache(layer, key, value, kv_cache, slot_mapping)
 
     mock_rotate.assert_not_called()
-    assert out_query is query
-    assert out_key is key
+    layer.impl.do_kv_cache_update.assert_called_once_with(
+        layer, key, value, kv_cache, slot_mapping
+    )
 
 
 def test_calculate_kv_scales_raises_at_load_time():

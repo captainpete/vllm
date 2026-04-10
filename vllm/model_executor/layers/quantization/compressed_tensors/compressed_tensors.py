@@ -1189,24 +1189,39 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
         return None
 
-    def apply_kv_cache(
+    def apply_query(
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the Q_ATTN Hadamard rotation before the attention kernel.
+
+        Called unconditionally on every forward pass so that Q is correctly
+        rotated for both prefill and decode, including decode steps where Q
+        attends against previously cached (rotated) K.
+        """
+        scheme = getattr(layer, "_ct_kv_transform", None)
+        if scheme is not None and scheme.type == "hadamard":
+            query = ops.hadacore_transform(query)
+        return query
+
+    def apply_kv_cache(
+        self,
+        layer: torch.nn.Module,
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply the resolved KV cache transform then write to the paged cache.
+    ) -> None:
+        """Apply the K_CACHE Hadamard rotation then write to the paged cache.
 
         Dispatches on the TransformScheme stored by _resolve_kv_transform at
         model load time.  The cache write is delegated to the base class.
 
         Currently supported scheme types:
           "hadamard" — deterministic Sylvester FWHT via ops.hadacore_transform.
-            Query and key are rotated in-place; K_CACHE and Q_ATTN share one
-            rotation matrix.  The inverse for V and output is absorbed offline
+            K_CACHE and Q_ATTN share one rotation matrix; Q rotation is handled
+            in apply_query.  The inverse for V and output is absorbed offline
             into W_v and W_o by llm-compressor.
 
         Not yet supported:
@@ -1218,9 +1233,8 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         """
         scheme = getattr(layer, "_ct_kv_transform", None)
         if scheme is not None and scheme.type == "hadamard":
-            query = ops.hadacore_transform(query)
             key = ops.hadacore_transform(key)
-        return super().apply_kv_cache(layer, query, key, value, kv_cache, slot_mapping)
+        super().apply_kv_cache(layer, key, value, kv_cache, slot_mapping)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """

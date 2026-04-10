@@ -145,7 +145,7 @@ class RopeReshapeKVCachePattern:
             q = q.view(-1, self.num_heads, self.head_size)
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
-            q_out, k_out, dummy = torch.ops.vllm.vllm_apply_kv_cache(
+            q_out, k_out, dummy = torch.ops.vllm.apply_kv_cache_update(
                 q, k, v, self.layer_name
             )
             return dummy, q_out, k_out, v
@@ -214,10 +214,11 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
                 # work to do between RoPE and the cache write (e.g. Hadamard
                 # rotation).  The fused triton kernel cannot accommodate an
                 # inter-step transform, so leave those layers on the general
-                # vllm_apply_kv_cache path which dispatches through the method.
+                # apply_kv_cache_update path which dispatches through the method.
                 qm = getattr(layer, "quant_method", None)
                 if qm is not None and (
                     type(qm).apply_kv_cache is not BaseKVCacheMethod.apply_kv_cache
+                    or type(qm).apply_query is not BaseKVCacheMethod.apply_query
                 ):
                     continue
                 for is_neox in [True, False]:

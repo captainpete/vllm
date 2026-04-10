@@ -168,7 +168,7 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
         q = q.view(-1, self.num_heads, self.head_size)
         k = k.view(-1, self.num_kv_heads, self.head_size)
         v = v.view(-1, self.num_kv_heads, self.head_size)
-        q, k, kv_cache_dummy_dep = torch.ops.vllm.vllm_apply_kv_cache(
+        q, k, kv_cache_dummy_dep = torch.ops.vllm.apply_kv_cache_update(
             q, k, v, self.layer_name
         )
         return q, k, v, kv_cache_dummy_dep
@@ -182,7 +182,7 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
                 ops.append(ROTARY_OP)
         else:
             ops.append(INDEX_SELECT_OP)
-        ops.append(torch.ops.vllm.vllm_apply_kv_cache.default)
+        ops.append(torch.ops.vllm.apply_kv_cache_update.default)
         return ops
 
     def ops_in_model_after(self) -> list[torch._ops.OpOverload]:

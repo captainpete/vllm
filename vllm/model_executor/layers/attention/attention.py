@@ -455,7 +455,7 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dummy_dep = None
             if self.use_direct_call:
                 if key is not None and value is not None:
-                    query, key, kv_cache_dummy_dep = vllm_apply_kv_cache(
+                    query, key, kv_cache_dummy_dep = apply_kv_cache_update(
                         query, key, value, self.layer_name
                     )
                 unified_attention_with_output(
@@ -468,8 +468,10 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
             else:
                 if key is not None and value is not None:
-                    query, key, kv_cache_dummy_dep = torch.ops.vllm.vllm_apply_kv_cache(
-                        query, key, value, self.layer_name
+                    query, key, kv_cache_dummy_dep = (
+                        torch.ops.vllm.apply_kv_cache_update(
+                            query, key, value, self.layer_name
+                        )
                     )
                 torch.ops.vllm.unified_attention_with_output(
                     query,
@@ -695,7 +697,7 @@ direct_register_custom_op(
 )
 
 
-def vllm_apply_kv_cache(
+def apply_kv_cache_update(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -733,22 +735,27 @@ def vllm_apply_kv_cache(
     )
 
     qm = getattr(attn_layer, "quant_method", None)
-    if qm is not None and should_write:
-        query, key = qm.apply_kv_cache(
-            attn_layer, query, key, value, kv_cache, slot_mapping
-        )
-    elif should_write:
-        assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
-            f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
-        )
-        attn_layer.impl.do_kv_cache_update(
-            attn_layer, key, value, kv_cache, slot_mapping
-        )
+
+    # Q transform is unconditional: Q must be prepared for attention on every
+    # forward pass regardless of whether a cache write is happening.
+    if qm is not None:
+        query = qm.apply_query(attn_layer, query)
+
+    if should_write:
+        if qm is not None:
+            qm.apply_kv_cache(attn_layer, key, value, kv_cache, slot_mapping)
+        else:
+            assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
+                f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
+            )
+            attn_layer.impl.do_kv_cache_update(
+                attn_layer, key, value, kv_cache, slot_mapping
+            )
 
     return query, key, torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
 
-def vllm_apply_kv_cache_fake(
+def apply_kv_cache_update_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -758,9 +765,9 @@ def vllm_apply_kv_cache_fake(
 
 
 direct_register_custom_op(
-    op_name="vllm_apply_kv_cache",
-    op_func=vllm_apply_kv_cache,
-    fake_impl=vllm_apply_kv_cache_fake,
+    op_name="apply_kv_cache_update",
+    op_func=apply_kv_cache_update,
+    fake_impl=apply_kv_cache_update_fake,
     mutates_args=[],
 )
 
