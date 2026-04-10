@@ -15,6 +15,7 @@ from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
 )
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
@@ -209,12 +210,15 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
         attn_layers = get_layers_from_vllm_config(config, Attention)
         for _, layer in attn_layers.items():
             if layer.impl.fused_rope_kvcache_supported():
-                # Layers with a pre-cache KV transform (e.g. Hadamard rotation)
-                # use the general vllm_apply_kv_cache path, which handles the
-                # transform between RoPE and the cache write.  The fused kernel
-                # cannot accommodate an inter-step transform without kernel-level
-                # changes, so we leave those layers on the unfused path.
-                if getattr(layer, "_ct_kv_transform", None) is not None:
+                # If the layer's quant method overrides apply_kv_cache it has
+                # work to do between RoPE and the cache write (e.g. Hadamard
+                # rotation).  The fused triton kernel cannot accommodate an
+                # inter-step transform, so leave those layers on the general
+                # vllm_apply_kv_cache path which dispatches through the method.
+                qm = getattr(layer, "quant_method", None)
+                if qm is not None and (
+                    type(qm).apply_kv_cache is not BaseKVCacheMethod.apply_kv_cache
+                ):
                     continue
                 for is_neox in [True, False]:
                     RopeReshapeKVCachePattern(
