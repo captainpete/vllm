@@ -242,26 +242,17 @@ def test_apply_kv_cache_no_transform_when_scheme_is_none():
     assert out_key is key
 
 
-def test_apply_kv_cache_raises_if_calculate_kv_scales():
-    """apply_kv_cache must raise when scheme is set and calculate_kv_scales=True."""
-    from unittest.mock import MagicMock
-
+def test_calculate_kv_scales_raises_at_load_time():
+    """calculate_kv_scales=True with a matched transform scheme must raise at
+    create_weights time, not at forward time."""
     quant_config = _make_quant_config(_make_transform_config("k_cache"))
     method = CompressedTensorsKVCacheMethod(quant_config)
 
     layer = _make_layer()
-    method.create_weights(layer)
     layer.calculate_kv_scales = True
-    layer.impl = MagicMock()
-
-    query = torch.randn(4, 8, 128)
-    key = torch.randn(4, 8, 128)
-    value = torch.randn(4, 8, 128)
-    kv_cache = torch.zeros(2, 4, 8, 128)
-    slot_mapping = torch.arange(4)
 
     with pytest.raises(ValueError, match="calculate_kv_scales"):
-        method.apply_kv_cache(layer, query, key, value, kv_cache, slot_mapping)
+        method.create_weights(layer)
 
 
 # ---------------------------------------------------------------------------

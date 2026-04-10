@@ -1177,6 +1177,14 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                         f"layer '{layer_name}'."
                     )
 
+                if getattr(layer, "calculate_kv_scales", False):
+                    raise ValueError(
+                        f"Layer '{layer_name}': cannot combine a K_CACHE/Q_ATTN "
+                        "transform with calculate_kv_scales=True. KV scale "
+                        "computation runs before the transform and would produce "
+                        "scales for un-transformed K."
+                    )
+
                 return scheme
 
         return None
@@ -1209,18 +1217,9 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
             incorrect TP > 1 guard in HadamardTransform.__init__.
         """
         scheme = getattr(layer, "_ct_kv_transform", None)
-        if scheme is not None:
-            if layer.calculate_kv_scales:
-                raise ValueError(
-                    f"Layer '{getattr(layer, 'layer_name', '')}': cannot "
-                    "combine a K_CACHE/Q_ATTN transform with "
-                    "calculate_kv_scales=True. KV scale computation runs "
-                    "before the transform and would produce scales for "
-                    "un-transformed K."
-                )
-            if scheme.type == "hadamard":
-                query = ops.hadacore_transform(query)
-                key = ops.hadacore_transform(key)
+        if scheme is not None and scheme.type == "hadamard":
+            query = ops.hadacore_transform(query)
+            key = ops.hadacore_transform(key)
         return super().apply_kv_cache(layer, query, key, value, kv_cache, slot_mapping)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
