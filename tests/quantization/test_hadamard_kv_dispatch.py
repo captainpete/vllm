@@ -3,8 +3,11 @@
 """
 Tests for CompressedTensorsKVCacheMethod K_CACHE/Q_ATTN dispatch.
 
-Covers _has_kq_attn_transform: config reading, per-layer targeting via
+Covers _resolve_kv_transform: config reading, per-layer targeting via
 is_match, and validation errors raised at model load time.
+
+Also covers apply_kv_cache: transform dispatch on scheme.type and the
+no-op path when _ct_kv_transform is None.
 
 These tests do not call the hadacore_transform kernel and therefore
 run on all platforms.
@@ -73,49 +76,53 @@ def _make_layer(layer_name: str = "model.layers.0.self_attn", head_size: int = 1
 
 
 # ---------------------------------------------------------------------------
-# Enabled cases
+# _resolve_kv_transform: enabled cases
 # ---------------------------------------------------------------------------
 
 
-def test_kq_transform_set_for_k_cache():
-    """K_CACHE location targeting this layer → True."""
+def test_kv_transform_set_for_k_cache():
+    """K_CACHE location targeting this layer → TransformScheme stored."""
+    from compressed_tensors.transform import TransformScheme
+
     quant_config = _make_quant_config(_make_transform_config("k_cache"))
     method = CompressedTensorsKVCacheMethod(quant_config)
 
     layer = _make_layer()
     method.create_weights(layer)
 
-    assert layer._kq_attn_transform is True
+    assert isinstance(layer._ct_kv_transform, TransformScheme)
 
 
-def test_kq_transform_set_for_q_attn():
-    """Q_ATTN location targeting this layer → True."""
+def test_kv_transform_set_for_q_attn():
+    """Q_ATTN location targeting this layer → TransformScheme stored."""
+    from compressed_tensors.transform import TransformScheme
+
     quant_config = _make_quant_config(_make_transform_config("q_attn"))
     method = CompressedTensorsKVCacheMethod(quant_config)
 
     layer = _make_layer()
     method.create_weights(layer)
 
-    assert layer._kq_attn_transform is True
+    assert isinstance(layer._ct_kv_transform, TransformScheme)
 
 
 # ---------------------------------------------------------------------------
-# Disabled cases
+# _resolve_kv_transform: disabled cases
 # ---------------------------------------------------------------------------
 
 
-def test_kq_transform_none_without_transform_config():
-    """No transform_config → _kq_attn_transform is False."""
+def test_kv_transform_none_without_transform_config():
+    """No transform_config → _ct_kv_transform is None."""
     quant_config = _make_quant_config(transform_config=None)
     method = CompressedTensorsKVCacheMethod(quant_config)
 
     layer = _make_layer()
     method.create_weights(layer)
 
-    assert layer._kq_attn_transform is False
+    assert layer._ct_kv_transform is None
 
 
-def test_kq_transform_none_for_non_attention_locations():
+def test_kv_transform_none_for_non_attention_locations():
     """INPUT/OUTPUT locations should not trigger KV rotation."""
     quant_config = _make_quant_config(_make_transform_config("input"))
     method = CompressedTensorsKVCacheMethod(quant_config)
@@ -123,20 +130,22 @@ def test_kq_transform_none_for_non_attention_locations():
     layer = _make_layer()
     method.create_weights(layer)
 
-    assert layer._kq_attn_transform is False
+    assert layer._ct_kv_transform is None
 
 
 # ---------------------------------------------------------------------------
-# Per-layer targeting
+# _resolve_kv_transform: per-layer targeting
 # ---------------------------------------------------------------------------
 
 
-def test_kq_transform_per_layer_targeting():
+def test_kv_transform_per_layer_targeting():
     """Scheme targeting only self_attn layers must not fire on other layers.
 
     Real R3 checkpoints target by class name (e.g. LlamaAttention) or regex.
     This test uses a regex that matches *self_attn suffixes only.
     """
+    from compressed_tensors.transform import TransformScheme
+
     quant_config = _make_quant_config(
         _make_transform_config("k_cache", targets=["re:.*self_attn"])
     )
@@ -148,12 +157,139 @@ def test_kq_transform_per_layer_targeting():
     method.create_weights(attn_layer)
     method.create_weights(other_layer)
 
-    assert attn_layer._kq_attn_transform is True, (
-        "self_attn layer should have rotation enabled"
+    assert isinstance(attn_layer._ct_kv_transform, TransformScheme), (
+        "self_attn layer should have a resolved TransformScheme"
     )
-    assert other_layer._kq_attn_transform is False, (
-        "mlp layer should not have rotation enabled"
+    assert other_layer._ct_kv_transform is None, (
+        "mlp layer should not have a resolved TransformScheme"
     )
+
+
+# ---------------------------------------------------------------------------
+# apply_kv_cache: transform dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_apply_query_calls_hadamard_transform():
+    """apply_query with a hadamard scheme must rotate query."""
+    from unittest.mock import patch
+
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    method.create_weights(layer)
+    layer.calculate_kv_scales = False
+
+    query = torch.randn(4, 8, 128)
+    rotated_query = torch.randn(4, 8, 128)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+        ".compressed_tensors.ops.hadacore_transform",
+        return_value=rotated_query,
+    ) as mock_rotate:
+        out_query = method.apply_query(layer, query)
+
+    mock_rotate.assert_called_once_with(query)
+    assert out_query is rotated_query
+
+
+def test_apply_kv_cache_calls_hadamard_transform():
+    """apply_kv_cache with a hadamard scheme must rotate key and write cache."""
+    from unittest.mock import MagicMock, patch
+
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    method.create_weights(layer)
+    layer.calculate_kv_scales = False
+    layer.impl = MagicMock()
+
+    key = torch.randn(4, 8, 128)
+    value = torch.randn(4, 8, 128)
+    kv_cache = torch.zeros(2, 4, 8, 128)
+    slot_mapping = torch.arange(4)
+
+    rotated_key = torch.randn(4, 8, 128)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+        ".compressed_tensors.ops.hadacore_transform",
+        return_value=rotated_key,
+    ) as mock_rotate:
+        method.apply_kv_cache(layer, key, value, kv_cache, slot_mapping)
+
+    mock_rotate.assert_called_once_with(key)
+    layer.impl.do_kv_cache_update.assert_called_once_with(
+        layer, rotated_key, value, kv_cache, slot_mapping
+    )
+
+
+def test_apply_query_no_transform_when_scheme_is_none():
+    """apply_query with no resolved scheme must not rotate query."""
+    from unittest.mock import patch
+
+    quant_config = _make_quant_config(transform_config=None)
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    method.create_weights(layer)
+    layer.calculate_kv_scales = False
+
+    query = torch.randn(4, 8, 128)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+        ".compressed_tensors.ops.hadacore_transform",
+    ) as mock_rotate:
+        out_query = method.apply_query(layer, query)
+
+    mock_rotate.assert_not_called()
+    assert out_query is query
+
+
+def test_apply_kv_cache_no_transform_when_scheme_is_none():
+    """apply_kv_cache with no resolved scheme must not rotate key."""
+    from unittest.mock import MagicMock, patch
+
+    quant_config = _make_quant_config(transform_config=None)
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    method.create_weights(layer)
+    layer.calculate_kv_scales = False
+    layer.impl = MagicMock()
+
+    key = torch.randn(4, 8, 128)
+    value = torch.randn(4, 8, 128)
+    kv_cache = torch.zeros(2, 4, 8, 128)
+    slot_mapping = torch.arange(4)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+        ".compressed_tensors.ops.hadacore_transform",
+    ) as mock_rotate:
+        method.apply_kv_cache(layer, key, value, kv_cache, slot_mapping)
+
+    mock_rotate.assert_not_called()
+    layer.impl.do_kv_cache_update.assert_called_once_with(
+        layer, key, value, kv_cache, slot_mapping
+    )
+
+
+def test_calculate_kv_scales_raises_at_load_time():
+    """calculate_kv_scales=True with a matched transform scheme must raise at
+    create_weights time, not at forward time."""
+    quant_config = _make_quant_config(_make_transform_config("k_cache"))
+    method = CompressedTensorsKVCacheMethod(quant_config)
+
+    layer = _make_layer()
+    layer.calculate_kv_scales = True
+
+    with pytest.raises(ValueError, match="calculate_kv_scales"):
+        method.create_weights(layer)
 
 
 # ---------------------------------------------------------------------------

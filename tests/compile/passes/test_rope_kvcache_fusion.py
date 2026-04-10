@@ -36,7 +36,6 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 INDEX_SELECT_OP = torch.ops.aten.index.Tensor
-VLLM_UNIFIED_KV_CACHE_UPDATE_OP = torch.ops.vllm.unified_kv_cache_update
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
@@ -169,8 +168,8 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
         q = q.view(-1, self.num_heads, self.head_size)
         k = k.view(-1, self.num_kv_heads, self.head_size)
         v = v.view(-1, self.num_kv_heads, self.head_size)
-        kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-            k, v, self.layer_name
+        q, k, kv_cache_dummy_dep = torch.ops.vllm.apply_kv_cache_update(
+            q, k, v, self.layer_name
         )
         return q, k, v, kv_cache_dummy_dep
 
@@ -183,7 +182,7 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
                 ops.append(ROTARY_OP)
         else:
             ops.append(INDEX_SELECT_OP)
-        ops.append(torch.ops.vllm.unified_kv_cache_update.default)
+        ops.append(torch.ops.vllm.apply_kv_cache_update.default)
         return ops
 
     def ops_in_model_after(self) -> list[torch._ops.OpOverload]:

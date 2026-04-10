@@ -16,9 +16,14 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     QuantizationType,
 )
-from compressed_tensors.transform import TransformConfig, TransformLocation
+from compressed_tensors.transform import (
+    TransformConfig,
+    TransformLocation,
+    TransformScheme,
+)
 from compressed_tensors.utils import is_match
 
+import vllm._custom_ops as ops
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1094,19 +1099,22 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                 _tp_aware_loader, kind="v", param_type="zero_point"
             )
 
-        # Wire up KQ cache Hadamard rotation.
-        # K_CACHE and Q_ATTN share the same rotation matrix.
-        # The inverse rotation for V and output is done in W_v/W_o by llm-compressor.
-        layer._kq_attn_transform = self._has_kq_attn_transform(layer)
+        # Resolve at model-load time which KV cache transform (if any) applies
+        # to this layer.  Stored on the layer so apply_kv_cache can dispatch
+        # at forward time without re-walking transform_config every call.
+        layer._ct_kv_transform = self._resolve_kv_transform(layer)
 
-    def _has_kq_attn_transform(self, layer: torch.nn.Module) -> bool:
-        """Return True if this layer should have K_CACHE/Q_ATTN Hadamard rotation.
+    def _resolve_kv_transform(self, layer: torch.nn.Module) -> TransformScheme | None:
+        """Return the TransformScheme for K_CACHE/Q_ATTN transforms on this
+        layer, or None if no transform applies.
 
-        Walks the transform_config looking for K_CACHE or Q_ATTN locations
-        whose targets match this specific layer.
+        Walks transform_config looking for K_CACHE or Q_ATTN locations whose
+        targets match this layer.  Validates the scheme and raises at model
+        load time if the configuration is unsupported, so errors surface
+        before the first forward pass.
         """
         if self.quant_config.transform_config is None:
-            return False
+            return None
 
         layer_name = getattr(layer, "layer_name", "")
         head_dim = getattr(layer, "head_size", None)
@@ -1121,59 +1129,112 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
                     TransformLocation.Q_ATTN,
                 ):
                     continue
-                if current_platform.is_rocm():
-                    raise NotImplementedError(
-                        "K_CACHE/Q_ATTN Hadamard rotation requires the "
-                        "hadacore_transform kernel, which is not supported "
-                        "on ROCm."
-                    )
                 if not is_match(layer_name, layer, args.targets, args.ignore):
                     continue
 
+                if current_platform.is_rocm():
+                    raise NotImplementedError(
+                        "K_CACHE/Q_ATTN transforms require the hadacore_transform "
+                        "kernel, which is not supported on ROCm."
+                    )
+                if scheme.type == "random-hadamard" or scheme.randomize:
+                    raise NotImplementedError(
+                        f"KV cache transform type '{scheme.type}' with "
+                        f"randomize={scheme.randomize} requires loading a "
+                        "per-layer rotation matrix from the checkpoint, which "
+                        "is not yet implemented for the KV cache path. See "
+                        "HadamardTransform in compressed_tensors for the "
+                        "naming-gap and TP-check blockers."
+                    )
                 if scheme.type != "hadamard":
                     raise NotImplementedError(
-                        f"KV cache rotation type '{scheme.type}' is not "
-                        "supported. Only 'hadamard' (deterministic Sylvester "
-                        "construction) is implemented. 'random-hadamard' and "
-                        "'random-matrix' require loading a stored rotation "
-                        "matrix, which is not yet implemented."
-                    )
-                if scheme.randomize:
-                    raise NotImplementedError(
-                        "KV cache Hadamard rotation with randomize=True is "
-                        "not supported. Randomized transforms require loading "
-                        "a per-layer rotation matrix from the checkpoint, "
-                        "which is not yet implemented."
+                        f"KV cache transform type '{scheme.type}' is not "
+                        "supported. Only 'hadamard' (deterministic) is "
+                        "currently implemented."
                     )
 
                 if head_dim is None:
                     raise ValueError(
-                        f"Layer '{layer_name}': K_CACHE/Q_ATTN Hadamard "
-                        "rotation requires head_size attribute."
+                        f"Layer '{layer_name}': K_CACHE/Q_ATTN transform "
+                        "requires head_size attribute."
                     )
                 if scheme.head_dim is not None and scheme.head_dim != head_dim:
                     raise ValueError(
                         f"Layer '{layer_name}': transform_config head_dim "
                         f"({scheme.head_dim}) does not match layer head_size "
-                        f"({head_dim}). K_CACHE/Q_ATTN rotation operates at "
+                        f"({head_dim}). K_CACHE/Q_ATTN transforms operate at "
                         "head granularity."
                     )
                 if head_dim <= 0 or (head_dim & (head_dim - 1)) != 0:
                     raise ValueError(
-                        f"KV cache Hadamard rotation requires head_dim to be "
-                        f"a power of two, got {head_dim} for layer "
-                        f"'{layer_name}'."
+                        f"K_CACHE/Q_ATTN transform requires head_dim to be a "
+                        f"power of two, got {head_dim} for layer '{layer_name}'."
                     )
                 if head_dim > 2**15:
                     raise ValueError(
-                        f"KV cache Hadamard rotation requires head_dim <= "
-                        f"2^15 (hadacore kernel constraint), got {head_dim} "
-                        f"for layer '{layer_name}'."
+                        f"K_CACHE/Q_ATTN transform requires head_dim <= 2^15 "
+                        f"(hadacore kernel constraint), got {head_dim} for "
+                        f"layer '{layer_name}'."
                     )
 
-                return True
+                if getattr(layer, "calculate_kv_scales", False):
+                    raise ValueError(
+                        f"Layer '{layer_name}': cannot combine a K_CACHE/Q_ATTN "
+                        "transform with calculate_kv_scales=True. KV scale "
+                        "computation runs before the transform and would produce "
+                        "scales for un-transformed K."
+                    )
 
-        return False
+                return scheme
+
+        return None
+
+    def apply_query(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the Q_ATTN Hadamard rotation before the attention kernel.
+
+        Called unconditionally on every forward pass so that Q is correctly
+        rotated for both prefill and decode, including decode steps where Q
+        attends against previously cached (rotated) K.
+        """
+        scheme = getattr(layer, "_ct_kv_transform", None)
+        if scheme is not None and scheme.type == "hadamard":
+            query = ops.hadacore_transform(query)
+        return query
+
+    def apply_kv_cache(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Apply the K_CACHE Hadamard rotation then write to the paged cache.
+
+        Dispatches on the TransformScheme stored by _resolve_kv_transform at
+        model load time.  The cache write is delegated to the base class.
+
+        Currently supported scheme types:
+          "hadamard" — deterministic Sylvester FWHT via ops.hadacore_transform.
+            K_CACHE and Q_ATTN share one rotation matrix; Q rotation is handled
+            in apply_query.  The inverse for V and output is absorbed offline
+            into W_v and W_o by llm-compressor.
+
+        Not yet supported:
+          "random-hadamard" — requires loading the per-layer rotation matrix
+            from the checkpoint.  Blocked by the naming gap between the
+            HuggingFace self_attn prefix (where R3 weights live) and the
+            self_attn.attn prefix where create_weights runs, and by the
+            incorrect TP > 1 guard in HadamardTransform.__init__.
+        """
+        scheme = getattr(layer, "_ct_kv_transform", None)
+        if scheme is not None and scheme.type == "hadamard":
+            key = ops.hadacore_transform(key)
+        super().apply_kv_cache(layer, key, value, kv_cache, slot_mapping)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """

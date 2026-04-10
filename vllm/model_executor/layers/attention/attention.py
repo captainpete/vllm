@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
-import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
@@ -378,25 +377,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # this variable will not be accessed if use_direct_call is True
         self.kv_cache = torch.tensor([])
 
-        # Set to True by CompressedTensorsKVCacheMethod.create_weights when the
-        # checkpoint's transform_config targets this layer with K_CACHE/Q_ATTN
-        # locations. Must be initialised before _init_kv_cache_quant.
-        self._kq_attn_transform = False
-
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
-
-        # Guard against combining Hadamard rotation with online KV scale.
-        # maybe_calc_kv_scales runs before the rotation, so scales would be
-        # computed on unrotated K.
-        if self._kq_attn_transform and self.calculate_kv_scales:
-            raise ValueError(
-                f"Layer '{prefix}': cannot combine K_CACHE/Q_ATTN Hadamard "
-                "rotation with calculate_kv_scales=True. The KV scale "
-                "computation (maybe_calc_kv_scales) runs before the rotation "
-                "and would produce scales for unrotated K. Either disable "
-                "calculate_kv_scales or remove the transform config."
-            )
 
         # for attn backends supporting query quantization
         self.query_quant = None
@@ -470,26 +452,11 @@ class Attention(nn.Module, AttentionLayerBase):
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size_v)
 
-            # K_CACHE/Q_ATTN Hadamard rotation (R3/SpinQuant-style).
-            # Applied post-RoPE, post-reshape, before both the KV cache write
-            # and the attention computation, so prefill and decode are consistent.
-            # K_CACHE and Q_ATTN share the same rotation matrix; V and output
-            # un-rotation are absorbed offline into W_v and W_o weights.
-            if self._kq_attn_transform and key is not None:
-                query = ops.hadacore_transform(query)
-                key = ops.hadacore_transform(key)
-
             kv_cache_dummy_dep = None
             if self.use_direct_call:
-                # Skip this if sharing KV cache with an earlier attention layer.
-                if (
-                    not self.attn_backend.forward_includes_kv_cache_update
-                    and self.kv_sharing_target_layer_name is None
-                    and key is not None
-                    and value is not None
-                ):
-                    kv_cache_dummy_dep = unified_kv_cache_update(
-                        key, value, self.layer_name
+                if key is not None and value is not None:
+                    query, key, kv_cache_dummy_dep = apply_kv_cache_update(
+                        query, key, value, self.layer_name
                     )
                 unified_attention_with_output(
                     query,
@@ -500,15 +467,11 @@ class Attention(nn.Module, AttentionLayerBase):
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
             else:
-                # Skip this if sharing KV cache with an earlier attention layer.
-                if (
-                    not self.attn_backend.forward_includes_kv_cache_update
-                    and self.kv_sharing_target_layer_name is None
-                    and key is not None
-                    and value is not None
-                ):
-                    kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-                        key, value, self.layer_name
+                if key is not None and value is not None:
+                    query, key, kv_cache_dummy_dep = (
+                        torch.ops.vllm.apply_kv_cache_update(
+                            query, key, value, self.layer_name
+                        )
                     )
                 torch.ops.vllm.unified_attention_with_output(
                     query,
@@ -730,6 +693,81 @@ direct_register_custom_op(
     op_name="unified_kv_cache_update",
     op_func=unified_kv_cache_update,
     fake_impl=unified_kv_cache_update_fake,
+    mutates_args=[],
+)
+
+
+def apply_kv_cache_update(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply pre-cache transforms and write key/value to the paged KV cache.
+
+    This is the MHA migration target for ``unified_kv_cache_update``.  When
+    the attention layer has a ``quant_method``, it dispatches to
+    ``BaseKVCacheMethod.apply_kv_cache``, which is responsible for both any
+    pre-cache transforms (e.g. Hadamard rotation) and the cache write.
+    Without a ``quant_method`` it falls back to
+    ``attn_layer.impl.do_kv_cache_update``, preserving existing behaviour.
+
+    The cache write is skipped (transforms still applied) when:
+    - ``forward_includes_kv_cache_update`` is True — the backend writes during
+      its own ``forward()`` call.
+    - ``kv_sharing_target_layer_name`` is set — this layer shares the cache
+      written by an earlier layer.
+    - ``slot_mapping`` is None — nothing to write (e.g. profiling run).
+
+    Returns ``(query, key, dummy_dep)`` where ``dummy_dep`` is a zero-element
+    tensor threaded into ``unified_attention_with_output`` to preserve
+    ordering under torch.compile.
+
+    Note: MLA uses a different tensor layout and a separate forward path;
+    this function is not called from ``MLAAttention.forward()``.
+    """
+    _, attn_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
+
+    should_write = (
+        not attn_layer.attn_backend.forward_includes_kv_cache_update
+        and attn_layer.kv_sharing_target_layer_name is None
+        and slot_mapping is not None
+    )
+
+    qm = getattr(attn_layer, "quant_method", None)
+
+    # Q transform is unconditional: Q must be prepared for attention on every
+    # forward pass regardless of whether a cache write is happening.
+    if qm is not None:
+        query = qm.apply_query(attn_layer, query)
+
+    if should_write:
+        if qm is not None:
+            qm.apply_kv_cache(attn_layer, key, value, kv_cache, slot_mapping)
+        else:
+            assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
+                f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
+            )
+            attn_layer.impl.do_kv_cache_update(
+                attn_layer, key, value, kv_cache, slot_mapping
+            )
+
+    return query, key, torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+
+
+def apply_kv_cache_update_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return query, key, torch.empty(0, device=query.device, dtype=query.dtype)
+
+
+direct_register_custom_op(
+    op_name="apply_kv_cache_update",
+    op_func=apply_kv_cache_update,
+    fake_impl=apply_kv_cache_update_fake,
     mutates_args=[],
 )
 
